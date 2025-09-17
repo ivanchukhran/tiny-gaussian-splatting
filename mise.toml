@@ -1,0 +1,11 @@
+[tools]
+python = "3.13"
+uv = "latest"
+
+[env]
+_.python.venv = { path = ".venv", create = true, uv_create_args = [
+    "--system-site-packages",
+] }
+
+[settings]
+python.uv_venv_auto = true
