@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import sys
 from dataclasses import dataclass
@@ -6,6 +7,7 @@ from typing import Tuple
 
 import numpy as np
 import torch
+from plyfile import PlyData, PlyElement
 
 # from sympy.tensor.array.dense_ndim_array import List,
 from sympy.utilities.misc import struct
@@ -311,6 +313,250 @@ def read_intrinsics_binary(path: str):
     return cameras
 
 
+class CameraInfo(NamedTuple):
+    uid: int
+    R: np.ndarray
+    T: np.ndarray
+    fov_x: np.ndarray | float
+    fov_y: np.ndarray | float
+    depth_params: dict | None
+    image_path: str
+    image_name: str
+    depth_path: str
+    width: int
+    height: int
+    is_test: bool
+
+
+def focal2fov(focal, pixels):
+    return 2 * math.atan(pixels / (2 * focal))
+
+
+def read_colmap_cameras(
+    cam_extrinsics,
+    cam_intrinsics,
+    depths_params,
+    images_folder,
+    depths_folder,
+    test_cam_names_list,
+):
+    camera_infos = []
+    for idx, key in enumerate(cam_extrinsics):
+        sys.stdout.write(f"Processing camera {idx + 1}/{len(cam_extrinsics)}\r")
+        sys.stdout.flush()
+
+        extr = cam_extrinsics[key]
+        intr = cam_intrinsics[extr.camera_id]
+        height = intr.height
+        width = intr.width
+        uid = intr.id
+        R = np.transpose(qvec2rotmat(extr.qvec))
+        T = np.array(extr.tvec)
+
+        if intr.model == "SIMPLE_PINHOLE":
+            focal_length_x = intr.params[0]
+            fov_y = focal2fov(focal_length_x, height)
+            fov_x = focal2fov(focal_length_x, width)
+        elif intr.model == "PINHOLE":
+            focal_length_x = intr.params[0]
+            focal_length_y = intr.params[1]
+            fov_y = focal2fov(focal_length_y, height)
+            fov_x = focal2fov(focal_length_x, width)
+        else:
+            raise ValueError(f"Unsupported camera model: {intr.model}")
+
+        n_remove = len(extr.name.split(".")[-1]) + 1
+        depth_params = None
+        if depths_params is not None:
+            try:
+                depth_params = depths_params[extr.name[:-n_remove]]
+            except Exception:
+                print("\n", key, "not found in depths_params")
+
+        image_path = os.path.join(images_folder, extr.name)
+        image_name = extr.name
+        depth_path = (
+            os.path.join(depths_folder, f"{extr.name[:-n_remove]}.png")
+            if depths_folder != ""
+            else ""
+        )
+
+        cam_info = CameraInfo(
+            uid=uid,
+            R=R,
+            T=T,
+            fov_y=fov_y,
+            fov_x=fov_x,
+            depth_params=depth_params,
+            image_path=image_path,
+            image_name=image_name,
+            depth_path=depth_path,
+            width=width,
+            height=height,
+            is_test=image_name in test_cam_names_list,
+        )
+        camera_infos.append(cam_info)
+
+    return camera_infos
+
+
+def world2view(r, t, translate: np.ndarray | None = None, scale: float = 1.0):
+    if translate is None:
+        translate = np.array([0.0, 0.0, 0.0])
+    Rt = np.zeros((4, 4))
+    Rt[:3, :3] = r.transpose()
+    Rt[:3, 3] = t
+    Rt[3, 3] = 1.0
+
+    c2w = np.linalg.inv(Rt)
+    cam_center = c2w[:3, 3]
+    cam_center = (cam_center + translate) * scale
+    c2w[:3, 3] = cam_center
+    Rt = np.linalg.inv(c2w)
+    return np.float32(Rt)
+
+
+def get_nerf_pp_norm(cam_info):
+    def get_center_diagonal(cam_centers):
+        cam_centers = np.hstack(cam_centers)
+        avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
+        center = avg_cam_center
+        dist = np.linalg.norm(cam_centers - center, axis=1)
+        diagonal = np.max(dist)
+        return center.flatten(), diagonal
+
+    cam_centers = []
+    for cam in cam_info:
+        w2c = world2view(cam.R, cam.T)
+        c2w = np.linalg.inv(w2c)
+        cam_centers.append(c2w[:3, 3:4])
+
+    center, diagonal = get_center_diagonal(cam_centers)
+    radius = diagonal * 1.1
+    translate = -center
+    return {"translate": translate, "radius": radius}
+
+
+class Point3D(NamedTuple):
+    id: int
+    xyz: np.ndarray
+    rgb: np.ndarray
+    error: np.ndarray | float
+    image_ids: np.ndarray
+    point_2d_indexes: np.ndarray
+
+
+def read_points_3d_binary(path: str):
+    points_3d = {}
+    with open(path, "rb") as fid:
+        num_points = read_next_bytes(fid, 8, "Q")[0]
+        for _ in range(num_points):
+            binary_point_line_properties = read_next_bytes(
+                fid, num_bytes=43, format_char_sequence="QdddBBBd"
+            )
+            point3D_id = binary_point_line_properties[0]
+            xyz = np.array(binary_point_line_properties[1:4])
+            rgb = np.array(binary_point_line_properties[4:7])
+            error = np.array(binary_point_line_properties[7])
+            track_length = read_next_bytes(fid, num_bytes=8, format_char_sequence="Q")[
+                0
+            ]
+            track_elems = read_next_bytes(
+                fid,
+                num_bytes=8 * track_length,
+                format_char_sequence="ii" * track_length,
+            )
+            image_ids = np.array(tuple(map(int, track_elems[0::2])))
+            point_2d_indexes = np.array(tuple(map(int, track_elems[1::2])))
+            points_3d[point3D_id] = Point3D(
+                id=point3D_id,
+                xyz=xyz,
+                rgb=rgb,
+                error=error,
+                image_ids=image_ids,
+                point_2d_indexes=point_2d_indexes,
+            )
+
+    return points_3d
+
+
+def read_points3D_text(path: str):
+    points_3d = {}
+    with open(path, "r") as fid:
+        while True:
+            line = fid.readline()
+            if not line:
+                break
+            line = line.strip()
+            if len(line) > 0 and not line.startswith("#"):
+                elems = line.split()
+                point_3d_id = int(elems[0])
+                xyz = np.array(tuple(map(float, elems[1:4])))
+                rgb = np.array(tuple(map(int, elems[4:7])))
+                error = float(elems[7])
+                image_ids = np.array(tuple(map(int, elems[8::2])))
+                point_2d_indexes = np.array(tuple(map(int, elems[9::2])))
+                points_3d[point_3d_id] = Point3D(
+                    id=point_3d_id,
+                    xyz=xyz,
+                    rgb=rgb,
+                    error=error,
+                    image_ids=image_ids,
+                    point_2d_indexes=point_2d_indexes,
+                )
+    return points_3d
+
+
+def storePly(path, xyz, rgb):
+    # Define the dtype for the structured array
+    dtype = [
+        ("x", "f4"),
+        ("y", "f4"),
+        ("z", "f4"),
+        ("nx", "f4"),
+        ("ny", "f4"),
+        ("nz", "f4"),
+        ("red", "u1"),
+        ("green", "u1"),
+        ("blue", "u1"),
+    ]
+
+    normals = np.zeros_like(xyz)
+
+    elements = np.empty(xyz.shape[0], dtype=dtype)
+    attributes = np.concatenate((xyz, normals, rgb), axis=1)
+    elements[:] = list(map(tuple, attributes))
+
+    # Create the PlyData object and write to file
+    vertex_element = PlyElement.describe(elements, "vertex")
+    ply_data = PlyData([vertex_element])
+    ply_data.write(path)
+
+
+class BasicPointCloud(NamedTuple):
+    points: np.ndarray
+    colors: np.ndarray
+    normals: np.ndarray
+
+
+def fetchPly(path: str):
+    plydata = PlyData.read(path)
+    vertices = plydata["vertex"]
+    positions = np.vstack([vertices["x"], vertices["y"], vertices["z"]]).T
+    colors = np.vstack([vertices["red"], vertices["green"], vertices["blue"]]).T / 255.0
+    normals = np.vstack([vertices["nx"], vertices["ny"], vertices["nz"]]).T
+    return BasicPointCloud(points=positions, colors=colors, normals=normals)
+
+
+class SceneInfo(NamedTuple):
+    point_cloud: BasicPointCloud
+    train_cameras: list
+    test_cameras: list
+    nerf_normalization: dict
+    ply_path: str
+    is_nerf_synthetic: bool
+
+
 def read_colmap_scene_info(
     path: str,
     images_dir: str,
@@ -362,15 +608,15 @@ def read_colmap_scene_info(
         cam_intrinsics=cam_intrinsics,
         depths_params=depth_params,
         images_folder=os.path.join(path, images_dir),
-        depth_folder=os.path.join(path, depth_dir),
-        test_camera_names_list=test_camera_names_list,
+        depths_folder=os.path.join(path, depth_dir),
+        test_cam_names_list=test_camera_names_list,
     )
     camera_infos = sorted(camera_infos_unsorted.copy(), key=lambda x: x.image_name)
 
     train_camera_infos = [c for c in camera_infos if train_test_exp or not c.is_test]
     test_camera_infos = [c for c in camera_infos if c.is_test]
 
-    nerf_normalization = gen_nerf_pp_norm(train_camera_infos)
+    nerf_normalization = get_nerf_pp_norm(train_camera_infos)
 
     ply_path = os.path.join(path, "sparse/0/points3D.ply")
     bin_path = os.path.join(path, "sparse/0/points3D.bin")
@@ -383,7 +629,7 @@ def read_colmap_scene_info(
             "Converting point3d.bin to .ply, will happen only the first time you open the scene."
         )
         try:
-            xyz, rgb, _ = read_points3D_binary(bin_path)
+            xyz, rgb, _ = read_points_3d_binary(bin_path)
         except Exception:
             xyz, rgb, _ = read_points3D_text(txt_path)
         storePly(ply_path, xyz, rgb)
